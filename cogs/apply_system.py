@@ -1,0 +1,1226 @@
+"""
+Unified Application System — FASTLIFE ROLEPLAY
+Professional FASTLIFE ROLEPLAY-style apply panels.
+  /setup apply kind:staff     apply_channel review_channel role reviewer_role banner_url
+  /setup apply kind:whitelist apply_channel review_channel role reviewer_role banner_url
+
+CHANGES IN THIS VERSION:
+  - The "Important Notice" block is now editable (folded into the
+    Set Title button, which now also saves a `notice_text`).
+  - BOTH Staff and Whitelist applications now use the conversational DM
+    flow: clicking Apply DMs the applicant and asks the questions one by
+    one as normal chat messages (with the Legal/Illegal question, when
+    present, still answered via buttons). The old popup-modal flow is no
+    longer used to submit an application (kept in the file, unused, in
+    case you want to revert).
+"""
+import asyncio
+import discord
+from discord.ext import commands
+from discord import app_commands
+import config
+import db
+from datetime import datetime
+
+APPLY_COLLECTION = "apply_settings"
+
+KIND_LABELS = {
+    "staff": "📋 Staff Application",
+    "whitelist": "🎮 Whitelist Application",
+}
+
+KIND_TITLE = {
+    "staff": "Staff",
+    "whitelist": "Whitelist",
+}
+
+DEFAULT_CONDITIONS = {
+    "staff": [
+        "You must be active in the community.",
+        "Good knowledge of server rules and standard etiquette.",
+        "Ability to handle high-pressure situations calmly.",
+        "No recent serious punishments or toxic behavior.",
+        "Minimum age of 15 years old.",
+    ],
+    "whitelist": [
+        "You must read all server rules before applying.",
+        "Good understanding of RolePlay basics (NLR, RDM, PowerGaming).",
+        "You must have a realistic character backstory ready.",
+        "No recent bans or serious punishments on record.",
+        "You must be active and serious about RolePlay.",
+    ],
+}
+
+DEFAULT_QUESTIONS = {
+    "staff": [
+        "What is your name and age?",
+        "How many hours per day can you dedicate to the server?",
+        "Do you have previous moderation experience? Explain.",
+        "Why do you want to join the staff team?",
+        "How would you handle a member who breaks the rules?",
+    ],
+    "whitelist": [
+        "What is your real name and age?",
+        "What is your in-game character name?",
+        "What do you know about our RolePlay rules (NLR, RDM, PowerGaming)?",
+        "Tell us your character's backstory.",
+        "Is your character Legal or Illegal, and why?",
+    ],
+}
+
+DEFAULT_NOTICE_TEXT = (
+    "> ⚠️ **Important Notice :**\n"
+    "> Please fill out the form honestly. Any fake information or "
+    "plagiarized answers will lead to an immediate denial and a "
+    "permanent blacklist from the recruitment."
+)
+
+# Default message sent in DM before the interview starts.
+# Supports {kind_label}, {server}, {count}, {minutes} placeholders.
+DEFAULT_DM_INTRO_TEMPLATE = (
+    "📋 **{kind_label}** — {server}\n"
+    "I'll ask you {count} question(s) here, one at a time. Just reply "
+    "normally in this DM. You have {minutes} minutes to answer each one."
+)
+
+# How long (seconds) an applicant has to answer each DM question before the
+# interview times out.
+DM_QUESTION_TIMEOUT = 300  # 5 minutes
+
+
+# ─── Storage helpers ─────────────────────────────────────────────────────────
+def load_apply() -> dict:
+    return db.load(APPLY_COLLECTION)
+
+
+def save_apply(data: dict):
+    db.save(APPLY_COLLECTION, data)
+
+
+def get_kind_cfg(guild_id: int, kind: str) -> dict:
+    data = load_apply()
+    return data.get(str(guild_id), {}).get(kind, {})
+
+
+def set_kind_cfg(guild_id: int, kind: str, cfg: dict):
+    data = load_apply()
+    guild_key = str(guild_id)
+    data.setdefault(guild_key, {})
+    data[guild_key][kind] = cfg
+    save_apply(data)
+
+
+_sessions: dict[int, dict] = {}
+
+
+def _split_legal_question(questions: list[str]):
+    """If one of the questions asks whether the character is Legal/Illegal,
+    pull it out so it can be answered with buttons instead of free text.
+    Returns (text_questions, legal_question_or_None)."""
+    for i, q in enumerate(questions):
+        ql = q.lower()
+        if "legal" in ql and "illegal" in ql:
+            remaining = questions[:i] + questions[i + 1:]
+            return remaining, q
+    return questions, None
+
+
+class LegalIllegalView(discord.ui.View):
+    """Shown after the text modal, for the one question that asks Legal vs Illegal.
+    (Kept for the old modal flow — no longer wired up by default, see
+    NOTE at the top of the file.)"""
+
+    def __init__(self, kind: str, text_questions: list[str], text_answers: list[str], legal_question: str):
+        super().__init__(timeout=180)
+        self.kind = kind
+        self.text_questions = text_questions
+        self.text_answers = text_answers
+        self.legal_question = legal_question
+
+    async def _finish(self, interaction: discord.Interaction, choice: str):
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(
+            content=f"**{self.legal_question}**\nSelected: **{choice}**",
+            view=self,
+        )
+        full_questions = self.text_questions + [self.legal_question]
+        full_answers = self.text_answers + [choice]
+        await _send_to_review(interaction, self.kind, full_questions, full_answers)
+
+    @discord.ui.button(label="Legal", emoji="⚖️", style=discord.ButtonStyle.success)
+    async def legal_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish(interaction, "Legal")
+
+    @discord.ui.button(label="Illegal", emoji="🚫", style=discord.ButtonStyle.danger)
+    async def illegal_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish(interaction, "Illegal")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Legacy: dynamic question modal (NOT used anymore now that Staff also
+#  uses the DM interview flow — kept here only in case you want to revert
+#  a given kind back to the modal popup).
+# ══════════════════════════════════════════════════════════════════════════
+def build_apply_modal(kind: str, questions: list[str]):
+    fields = {}
+    for i, q in enumerate(questions[:5]):
+        fields[f"a{i}"] = discord.ui.TextInput(
+            label=q[:45],
+            style=discord.TextStyle.paragraph if i >= 2 else discord.TextStyle.short,
+            placeholder="Type your answer here...",
+            max_length=500,
+            required=True,
+        )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        answers = [getattr(self, f"a{i}").value for i in range(len(questions))]
+        await _send_to_review(interaction, kind, questions, answers)
+
+    title = f"📋 {KIND_LABELS.get(kind, kind.title())}"[:45]
+    attrs = {"__discord_ui_modal__": True, "title": title, "on_submit": on_submit}
+    attrs.update(fields)
+    ModalClass = type("ApplyModal", (discord.ui.Modal,), attrs)
+    return ModalClass
+
+
+def build_apply_modal_with_choice(kind: str, text_questions: list[str], legal_question: str):
+    """Same as build_apply_modal, but the Legal/Illegal question is answered
+    afterwards with two buttons instead of being a text field here."""
+    fields = {}
+    for i, q in enumerate(text_questions[:5]):
+        fields[f"a{i}"] = discord.ui.TextInput(
+            label=q[:45],
+            style=discord.TextStyle.paragraph if i >= 2 else discord.TextStyle.short,
+            placeholder="Type your answer here...",
+            max_length=500,
+            required=True,
+        )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        answers = [getattr(self, f"a{i}").value for i in range(len(text_questions))]
+        await interaction.response.send_message(
+            content=f"**{legal_question}**\nChoose one:",
+            view=LegalIllegalView(kind, text_questions, answers, legal_question),
+            ephemeral=True,
+        )
+
+    title = f"📋 {KIND_LABELS.get(kind, kind.title())}"[:45]
+    attrs = {"__discord_ui_modal__": True, "title": title, "on_submit": on_submit}
+    attrs.update(fields)
+    ModalClass = type("ApplyModal", (discord.ui.Modal,), attrs)
+    return ModalClass
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Shared: post an application to the review channel
+# ══════════════════════════════════════════════════════════════════════════
+async def _post_application(guild: discord.Guild, user, kind: str, questions: list, answers: list):
+    """Builds the review embed and posts it to the configured review channel.
+    Returns (success: bool, error_message: str)."""
+    cfg = get_kind_cfg(guild.id, kind)
+    review_id = cfg.get("review_channel_id")
+    review_ch = guild.get_channel(review_id) if review_id else None
+    if not review_ch:
+        return False, "❌ The review channel isn't configured yet. Contact an admin."
+
+    embed = discord.Embed(
+        title=f"{KIND_LABELS.get(kind, kind.title())} — New Application",
+        description=(
+            f"**Applicant:** {user.mention} (`{user.display_name}`)\n"
+            f"ID: `{user.id}`"
+        ),
+        color=config.WARNING_COLOR,
+        timestamp=datetime.now()
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+    for i, (q, a) in enumerate(zip(questions, answers), 1):
+        embed.add_field(name=f"{i}. {q[:50]}", value=a or "—", inline=False)
+    embed.add_field(
+        name="Account Age",
+        value=f"<t:{int(user.created_at.timestamp())}:R>",
+        inline=True
+    )
+    joined_at = getattr(user, "joined_at", None)
+    if joined_at:
+        embed.add_field(
+            name="Joined Server",
+            value=f"<t:{int(joined_at.timestamp())}:R>",
+            inline=True
+        )
+    embed.set_footer(text=f"{config.SERVER_NAME}")
+
+    view = ApplyReviewView(kind=kind, applicant_id=user.id)
+    await review_ch.send(embed=embed, view=view)
+    return True, ""
+
+
+async def _send_to_review(interaction: discord.Interaction, kind: str, questions: list, answers: list):
+    """Legacy modal-flow helper: posts the application, then confirms via the
+    interaction. Not called anymore by default (see NOTE at top of file),
+    kept for the old modal path."""
+    ok, err = await _post_application(interaction.guild, interaction.user, kind, questions, answers)
+    if not ok:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+
+    confirm = discord.Embed(
+        title="✅ Application Sent!",
+        description="📨 Your application reached the review team. You'll get a DM once it's decided. 📬",
+        color=config.SUCCESS_COLOR
+    )
+    confirm.set_footer(text=f"{config.SERVER_NAME}")
+    await interaction.response.send_message(embed=confirm, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  DM interview flow (bot asks, applicant answers in DM) — used for BOTH
+#  Staff and Whitelist applications now.
+# ══════════════════════════════════════════════════════════════════════════
+class DMChoiceView(discord.ui.View):
+    """Legal/Illegal picker used inside the DM interview."""
+
+    def __init__(self, allowed_user_id: int):
+        super().__init__(timeout=DM_QUESTION_TIMEOUT)
+        self.choice = None
+        self.allowed_user_id = allowed_user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.allowed_user_id:
+            await interaction.response.send_message("❌ This isn't your application.", ephemeral=True)
+            return False
+        return True
+
+    async def _finish(self, interaction: discord.Interaction, choice: str):
+        self.choice = choice
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    @discord.ui.button(label="Legal", emoji="⚖️", style=discord.ButtonStyle.success)
+    async def legal_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish(interaction, "Legal")
+
+    @discord.ui.button(label="Illegal", emoji="🚫", style=discord.ButtonStyle.danger)
+    async def illegal_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish(interaction, "Illegal")
+
+
+class ConfirmSubmitView(discord.ui.View):
+    """Shown at the end of the DM interview with a recap of all answers.
+    The applicant must press Confirm before the application is actually
+    posted to the review channel — mirrors the "review before you submit"
+    step of most apply-bots."""
+
+    def __init__(self, allowed_user_id: int):
+        super().__init__(timeout=DM_QUESTION_TIMEOUT)
+        self.allowed_user_id = allowed_user_id
+        self.result: bool | None = None  # True = confirmed, False = cancelled, None = timed out
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.allowed_user_id:
+            await interaction.response.send_message("❌ This isn't your application.", ephemeral=True)
+            return False
+        return True
+
+    async def _finish(self, interaction: discord.Interaction, result: bool):
+        self.result = result
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    @discord.ui.button(label="Confirm & Submit", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish(interaction, True)
+
+    @discord.ui.button(label="Cancel", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish(interaction, False)
+
+
+def _build_recap_embed(kind: str, questions: list[str], answers: list[str]) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"📝 Review your {KIND_TITLE.get(kind, kind.title()).lower()} application",
+        description="Here's what you answered. Confirm to send it to the review team, or cancel to discard it.",
+        color=config.EMBED_COLOR,
+    )
+    for i, (q, a) in enumerate(zip(questions, answers), 1):
+        embed.add_field(name=f"{i}. {q[:100]}", value=(a or "—")[:1000], inline=False)
+    return embed
+
+
+async def _run_dm_interview(bot: commands.Bot, dm: discord.DMChannel, guild: discord.Guild,
+                             user: discord.abc.User, kind: str, questions: list):
+    """Runs entirely in the background (started as a task). Asks each question
+    as a clearly boxed embed (Question X/N) and waits for the applicant's reply."""
+    text_questions, legal_question = _split_legal_question(questions)
+    total = len(text_questions) + (1 if legal_question else 0)
+    answers = []
+
+    def check(m: discord.Message) -> bool:
+        return m.author.id == user.id and m.channel.id == dm.id
+
+    def question_embed(idx: int, question_text: str) -> discord.Embed:
+        e = discord.Embed(description=f"**{question_text}**", color=config.EMBED_COLOR)
+        e.set_author(name=f"❓ Question {idx}/{total}")
+        return e
+
+    try:
+        for idx, q in enumerate(text_questions, 1):
+            await dm.send(embed=question_embed(idx, q))
+            msg = await bot.wait_for("message", check=check, timeout=DM_QUESTION_TIMEOUT)
+            content = msg.content.strip() or "—"
+            answers.append(content[:500])
+
+        full_questions = list(text_questions)
+        if legal_question:
+            view = DMChoiceView(user.id)
+            await dm.send(embed=question_embed(total, legal_question), view=view)
+            await view.wait()
+            if view.choice is None:
+                await dm.send("⌛ You took too long to answer. Please reapply from the server whenever you're ready.")
+                return
+            answers.append(view.choice)
+            full_questions.append(legal_question)
+
+    except asyncio.TimeoutError:
+        await dm.send("⌛ You took too long to respond. Please reapply from the server whenever you're ready.")
+        return
+    except discord.Forbidden:
+        return
+
+    # ── Recap + confirm before actually submitting ────────────────────────
+    try:
+        confirm_view = ConfirmSubmitView(user.id)
+        await dm.send(embed=_build_recap_embed(kind, full_questions, answers), view=confirm_view)
+        await confirm_view.wait()
+    except discord.Forbidden:
+        return
+
+    if confirm_view.result is None:
+        await dm.send("⌛ You took too long to confirm. Please reapply from the server whenever you're ready.")
+        return
+    if confirm_view.result is False:
+        await dm.send("🗑️ Application discarded. Feel free to reapply anytime from the server.")
+        return
+
+    ok, err = await _post_application(guild, user, kind, full_questions, answers)
+    if ok:
+        await dm.send("✅ Thanks! Your application has been submitted. You'll get a DM once it's reviewed.")
+    else:
+        await dm.send(err)
+
+
+async def _start_dm_interview(interaction: discord.Interaction, kind: str, questions: list, cfg: dict):
+    template = cfg.get("dm_intro_text") or DEFAULT_DM_INTRO_TEMPLATE
+    fmt_kwargs = {
+        "kind_label": KIND_LABELS.get(kind, kind.title()),
+        "server": interaction.guild.name,
+        "count": len(questions),
+        "minutes": DM_QUESTION_TIMEOUT // 60,
+    }
+    try:
+        intro_text = template.format(**fmt_kwargs)
+    except (KeyError, IndexError, ValueError):
+        # Admin used an unknown/broken placeholder — fall back to the default.
+        intro_text = DEFAULT_DM_INTRO_TEMPLATE.format(**fmt_kwargs)
+
+    try:
+        dm = await interaction.user.create_dm()
+        await dm.send(intro_text)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "❌ I can't DM you! Please enable direct messages from server members and try again.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(
+        "📬 Check your DMs — I've sent you the application questions there!",
+        ephemeral=True
+    )
+
+    bot = interaction.client
+    bot.loop.create_task(
+        _run_dm_interview(bot, dm, interaction.guild, interaction.user, kind, questions)
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Applicant-facing: the whole apply card — Components V2 (Container)
+#  ONE combined message: title + conditions + notice + banner + footer/button
+#  all inside the same card, no separate embed+view.
+# ══════════════════════════════════════════════════════════════════════════
+BUTTON_STYLES = {
+    "grey": discord.ButtonStyle.secondary,
+    "gray": discord.ButtonStyle.secondary,
+    "blue": discord.ButtonStyle.primary,
+    "blurple": discord.ButtonStyle.primary,
+    "green": discord.ButtonStyle.success,
+    "red": discord.ButtonStyle.danger,
+}
+
+
+class ApplyButtonView(discord.ui.LayoutView):
+    """Persistent — one instance per (guild, kind), rebuilt from cfg.
+    NOTE: constructor is now ApplyButtonView(kind, cfg) — if your startup
+    code re-registers persistent views (e.g. in on_ready/setup_hook), update
+    that call to pass cfg too: ApplyButtonView(kind, get_kind_cfg(guild_id, kind))
+    """
+    def __init__(self, kind: str, cfg: dict):
+        super().__init__(timeout=None)
+        self.kind = kind
+
+        title = cfg.get("title") or f"{config.SERVER_NAME} — {KIND_LABELS.get(kind, kind.title())}"
+        conditions = cfg.get("conditions") or DEFAULT_CONDITIONS.get(kind, [])
+        banner_url = cfg.get("banner_url")
+
+        default_label = "Staff Application" if kind == "staff" else "Apply for Whitelist"
+        button_label = cfg.get("button_label") or default_label
+        button_emoji = cfg.get("button_emoji") or "↗️"
+        button_style = BUTTON_STYLES.get((cfg.get("button_style") or "grey").lower(), discord.ButtonStyle.secondary)
+
+        conditions_text = "\n".join(f"{i}. {c}" for i, c in enumerate(conditions, 1))
+        default_description = (
+            f"**Before applying** to join the **{config.SERVER_NAME}** "
+            f"{'Staff Team' if kind == 'staff' else 'Whitelist'}, "
+            f"make sure you meet the following conditions :"
+        )
+        description = cfg.get("description") or default_description
+        title_desc_text = f"# {title}\n\n{description}"
+        # Fully editable — falls back to the default only if the admin never
+        # customized it via the Set Title button.
+        notice_text = cfg.get("notice_text") or DEFAULT_NOTICE_TEXT
+        footer_text = cfg.get("footer_text") or f"With love, **{config.SERVER_NAME}** Team."
+
+        btn = discord.ui.Button(
+            label=button_label,
+            emoji=button_emoji if button_emoji else None,
+            style=button_style,
+            custom_id=f"apply_open_{kind}",
+        )
+        btn.callback = self.apply_click
+
+        items = [
+            discord.ui.TextDisplay(title_desc_text),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(conditions_text),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(notice_text),
+        ]
+        if banner_url:
+            items.append(discord.ui.Separator())
+            items.append(discord.ui.MediaGallery(discord.MediaGalleryItem(banner_url)))
+        items.append(discord.ui.Separator())
+        # Section = text on the left, accessory (the button) lined up on the
+        # right, on the SAME row — this is what puts the button next to the
+        # footer line inside the card, exactly like the FASTLIFE ROLEPLAY panel.
+        items.append(discord.ui.Section(discord.ui.TextDisplay(footer_text), accessory=btn))
+
+        container = discord.ui.Container(*items, accent_color=0x3B82F6)
+        self.add_item(container)
+
+    async def apply_click(self, interaction: discord.Interaction):
+        cfg = get_kind_cfg(interaction.guild_id, self.kind)
+        role_id = cfg.get("role_id")
+        if role_id:
+            role = interaction.guild.get_role(role_id)
+            if role and role in interaction.user.roles:
+                await interaction.response.send_message("⚠️ You already have this role!", ephemeral=True)
+                return
+        questions = cfg.get("questions") or DEFAULT_QUESTIONS.get(self.kind, [])
+
+        # Both Staff and Whitelist now use the conversational DM interview:
+        # the bot DMs the applicant and asks the questions one at a time,
+        # and the applicant answers as normal chat messages.
+        await _start_dm_interview(interaction, self.kind, questions, cfg)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  DM notifications — Components V2 card (accent bar + separators), instead
+#  of a plain embed, so accept/reject/ask DMs match the branded panel look.
+# ══════════════════════════════════════════════════════════════════════════
+class DecisionCardView(discord.ui.LayoutView):
+    """One-off card used only for DMs — not persistent, no buttons.
+
+    icon         — a single emoji shown next to the heading (✅ / 🚫 / 💬 ...)
+    heading      — e.g. "Whitelist Application Approved"
+    body_lines   — each becomes its own line under the heading
+                   (use "• **Label** : value" for the bullet rows)
+    accent_color — the color of the left accent bar
+    """
+
+    def __init__(self, *, icon: str, heading: str, body_lines: list[str], accent_color: int):
+        super().__init__(timeout=None)
+        footer_text = (
+            f"All Rights Reserved to **{config.SERVER_NAME}** Team - "
+            f"{datetime.now().strftime('%B %d, %Y')}"
+        )
+        items = [
+            discord.ui.TextDisplay(f"# {icon} {heading}"),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay("\n".join(body_lines)),
+            discord.ui.Separator(),
+            discord.ui.TextDisplay(footer_text),
+        ]
+        container = discord.ui.Container(*items, accent_color=accent_color)
+        self.add_item(container)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Staff-facing: Accept / Accept+Reason / Denied / Denied+Reason / Ask buttons
+# ══════════════════════════════════════════════════════════════════════════
+async def _finalize_accept(interaction: discord.Interaction, kind: str, uid: int,
+                            reason: str | None, view: "ApplyReviewView"):
+    member = interaction.guild.get_member(uid)
+    if not member:
+        await interaction.response.send_message("⚠️ Member not found!", ephemeral=True)
+        return
+
+    cfg = get_kind_cfg(interaction.guild_id, kind)
+    role_id = cfg.get("role_id")
+    role_given = False
+    if role_id:
+        role = interaction.guild.get_role(role_id)
+        if role:
+            try:
+                await member.add_roles(role, reason=f"Application accepted by {interaction.user}")
+                role_given = True
+            except discord.Forbidden:
+                pass
+
+    old = interaction.message.embeds[0]
+    new_embed = old.copy()
+    new_embed.color = config.SUCCESS_COLOR
+    new_embed.title = f"{old.title} — Accepted"
+    decision_lines = [
+        f"Accepted by: {interaction.user.mention}",
+        f"<t:{int(datetime.now().timestamp())}:F>",
+        "Role given" if role_given else "Could not give the role",
+    ]
+    if reason:
+        decision_lines.append(f"Reason: {reason}")
+    new_embed.add_field(name="Decision", value="\n".join(decision_lines), inline=False)
+    for c in view.children:
+        c.disabled = True
+    await interaction.message.edit(embed=new_embed, view=view)
+
+    try:
+        body_lines = [
+            f"Your {KIND_TITLE.get(kind, kind).lower()} application has been approved By {interaction.user.mention}.",
+            f"• **Server** : {interaction.guild.name}",
+        ]
+        if reason:
+            body_lines.append(f"• **Reason** : {reason}")
+        if not role_given:
+            body_lines.append("• ⚠️ The role could not be assigned automatically — contact an administrator.")
+        card = DecisionCardView(
+            icon="✅",
+            heading=f"{KIND_TITLE.get(kind, kind.title())} Application Approved",
+            body_lines=body_lines,
+            accent_color=config.SUCCESS_COLOR,
+        )
+        await member.send(view=card)
+    except discord.Forbidden:
+        pass
+
+    await interaction.response.send_message(
+        f"✅ Accepted {member.mention}{', role given' if role_given else ''}.",
+        ephemeral=True
+    )
+
+
+async def _finalize_deny(interaction: discord.Interaction, kind: str, uid: int,
+                          reason: str | None, view: "ApplyReviewView"):
+    member = interaction.guild.get_member(uid)
+
+    old = interaction.message.embeds[0]
+    new_embed = old.copy()
+    new_embed.color = config.ERROR_COLOR
+    new_embed.title = f"{old.title} — Denied"
+    decision_value = f"Denied by {interaction.user.mention}"
+    if reason:
+        decision_value += f"\nReason: {reason}"
+    new_embed.add_field(name="Decision", value=decision_value, inline=False)
+    for c in view.children:
+        c.disabled = True
+    await interaction.message.edit(embed=new_embed, view=view)
+
+    if member:
+        try:
+            body_lines = [
+                f"Your {KIND_TITLE.get(kind, kind).lower()} application has been denied by {interaction.user.mention}.",
+                f"• **Server** : {interaction.guild.name}",
+            ]
+            if reason:
+                body_lines.append(f"• **Reason** : {reason}")
+            card = DecisionCardView(
+                icon="🚫",
+                heading=f"{KIND_TITLE.get(kind, kind.title())} Application Denied",
+                body_lines=body_lines,
+                accent_color=config.ERROR_COLOR,
+            )
+            await member.send(view=card)
+        except Exception:
+            pass
+
+    await interaction.response.send_message(
+        f"✅ Denied{' and the member was notified' if member else ' (member left the server, no DM sent)'}.",
+        ephemeral=True
+    )
+
+
+class ApplyReviewView(discord.ui.View):
+    def __init__(self, kind: str = "staff", applicant_id: int = 0):
+        super().__init__(timeout=None)
+        self.kind = kind
+        self.applicant_id = applicant_id
+        self.btn_accept.custom_id        = f"apply_accept_{kind}_{applicant_id}"
+        self.btn_accept_reason.custom_id = f"apply_acceptreason_{kind}_{applicant_id}"
+        self.btn_deny.custom_id          = f"apply_deny_{kind}_{applicant_id}"
+        self.btn_deny_reason.custom_id   = f"apply_denyreason_{kind}_{applicant_id}"
+
+    def _admin(self, inter: discord.Interaction) -> bool:
+        # Admins / manage-roles always allowed
+        if inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_roles:
+            return True
+        # Otherwise check the configured reviewer role (read live from storage,
+        # since this view is persistent and rebuilt across restarts).
+        kind, _ = self._parse_ids()
+        cfg = get_kind_cfg(inter.guild_id, kind)
+        reviewer_role_id = cfg.get("reviewer_role_id")
+        if reviewer_role_id:
+            role = inter.guild.get_role(reviewer_role_id)
+            if role and role in inter.user.roles:
+                return True
+        return False
+
+    def _parse_ids(self) -> tuple[str, int]:
+        try:
+            parts = self.btn_accept.custom_id.split("_")
+            return parts[2], int(parts[3])
+        except Exception:
+            return self.kind, self.applicant_id
+
+    @discord.ui.button(label="✅ Accept", style=discord.ButtonStyle.success, custom_id="apply_accept_0_0")
+    async def btn_accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._admin(interaction):
+            await interaction.response.send_message("❌ Staff only!", ephemeral=True)
+            return
+        kind, uid = self._parse_ids()
+        await _finalize_accept(interaction, kind, uid, None, self)
+
+    @discord.ui.button(label="✅ Accept + Reason", style=discord.ButtonStyle.success, custom_id="apply_acceptreason_0_0")
+    async def btn_accept_reason(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._admin(interaction):
+            await interaction.response.send_message("❌ Staff only!", ephemeral=True)
+            return
+        kind, uid = self._parse_ids()
+        await interaction.response.send_modal(AcceptModal(kind=kind, applicant_id=uid, view=self))
+
+    @discord.ui.button(label="❌ Denied", style=discord.ButtonStyle.danger, custom_id="apply_deny_0_0")
+    async def btn_deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._admin(interaction):
+            await interaction.response.send_message("❌ Staff only!", ephemeral=True)
+            return
+        kind, uid = self._parse_ids()
+        await _finalize_deny(interaction, kind, uid, None, self)
+
+    @discord.ui.button(label="❌ Denied + Reason", style=discord.ButtonStyle.danger, custom_id="apply_denyreason_0_0")
+    async def btn_deny_reason(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._admin(interaction):
+            await interaction.response.send_message("❌ Staff only!", ephemeral=True)
+            return
+        kind, uid = self._parse_ids()
+        await interaction.response.send_modal(DenyModal(kind=kind, applicant_id=uid, view=self))
+
+
+class AcceptModal(discord.ui.Modal, title="✅ Acceptance Reason"):
+    reason = discord.ui.TextInput(
+        label="Reason (optional)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Optional note to include in the applicant's DM...",
+        max_length=500,
+        required=False,
+    )
+
+    def __init__(self, kind: str, applicant_id: int, view: ApplyReviewView):
+        super().__init__()
+        self.kind = kind
+        self.applicant_id = applicant_id
+        self.review_view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _finalize_accept(
+            interaction, self.kind, self.applicant_id,
+            self.reason.value.strip() or None, self.review_view
+        )
+
+
+class DenyModal(discord.ui.Modal, title="❌ Denial Reason"):
+    reason = discord.ui.TextInput(
+        label="Reason",
+        style=discord.TextStyle.paragraph,
+        placeholder="Write a clear reason for the denial...",
+        max_length=500
+    )
+
+    def __init__(self, kind: str, applicant_id: int, view: ApplyReviewView):
+        super().__init__()
+        self.kind = kind
+        self.applicant_id = applicant_id
+        self.review_view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _finalize_deny(
+            interaction, self.kind, self.applicant_id,
+            self.reason.value.strip() or None, self.review_view
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Emoji picker — Discord bots can't summon the native emoji picker from a
+#  button or select menu (that panel only opens from the client's own
+#  "add reaction" icon on a message). So instead: the bot posts a small
+#  prompt message, the admin taps the ➕ reaction icon on THAT message —
+#  which opens their real emoji picker (server emojis, favorites, search,
+#  everything) — and whatever emoji they react with is what gets saved.
+#  No typing, no codes, full picker. See ApplySystem.on_raw_reaction_add
+#  below for where the reaction is caught.
+# ══════════════════════════════════════════════════════════════════════════
+# message_id -> {"admin_id": int, "interaction": discord.Interaction}
+_pending_emoji_picks: dict[int, dict] = {}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Admin-facing: /setup apply control panel
+# ══════════════════════════════════════════════════════════════════════════
+class SetupApplyControlView(discord.ui.View):
+    def __init__(self, admin_id: int):
+        super().__init__(timeout=300)
+        self.admin_id = admin_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.admin_id:
+            await interaction.response.send_message("❌ Only the admin who ran /setup apply can use this.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Set Questions", emoji="❓", style=discord.ButtonStyle.secondary)
+    async def set_questions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = _sessions.get(self.admin_id)
+        if not session:
+            await interaction.response.send_message("⚠️ Session expired, run `/setup apply` again.", ephemeral=True)
+            return
+        current = session.get("questions") or DEFAULT_QUESTIONS.get(session["kind"], [])
+        await interaction.response.send_modal(QuestionsModal(self.admin_id, current))
+
+    @discord.ui.button(label="Set Title/Notice", emoji="📝", style=discord.ButtonStyle.secondary)
+    async def set_title(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = _sessions.get(self.admin_id)
+        if not session:
+            await interaction.response.send_message("⚠️ Session expired, run `/setup apply` again.", ephemeral=True)
+            return
+        await interaction.response.send_modal(TitleModal(self.admin_id, session))
+
+    @discord.ui.button(label="Set Conditions", emoji="📋", style=discord.ButtonStyle.secondary)
+    async def set_conditions(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = _sessions.get(self.admin_id)
+        if not session:
+            await interaction.response.send_message("⚠️ Session expired, run `/setup apply` again.", ephemeral=True)
+            return
+        current = session.get("conditions") or DEFAULT_CONDITIONS.get(session["kind"], [])
+        await interaction.response.send_modal(ConditionsModal(self.admin_id, current))
+
+    @discord.ui.button(label="Set Button Text", emoji="🎛️", style=discord.ButtonStyle.secondary)
+    async def set_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = _sessions.get(self.admin_id)
+        if not session:
+            await interaction.response.send_message("⚠️ Session expired, run `/setup apply` again.", ephemeral=True)
+            return
+        await interaction.response.send_modal(ButtonModal(self.admin_id, session))
+
+    @discord.ui.button(label="Set DM Message", emoji="📨", style=discord.ButtonStyle.secondary)
+    async def set_dm_message(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = _sessions.get(self.admin_id)
+        if not session:
+            await interaction.response.send_message("⚠️ Session expired, run `/setup apply` again.", ephemeral=True)
+            return
+        await interaction.response.send_modal(DMMessageModal(self.admin_id, session))
+
+    @discord.ui.button(label="Set Emoji", emoji="😀", style=discord.ButtonStyle.secondary)
+    async def set_emoji(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = _sessions.get(self.admin_id)
+        if not session:
+            await interaction.response.send_message("⚠️ Session expired, run `/setup apply` again.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "👇 A message was posted below — tap its ➕ reaction icon to open your "
+            "full emoji picker (server emojis, favorites, search, everything) and "
+            "react with the one you want. I'll grab it automatically.",
+            ephemeral=True,
+        )
+        prompt = await interaction.channel.send(
+            f"{interaction.user.mention} react to **this message** with the emoji "
+            f"you want for the button 👇"
+        )
+        _pending_emoji_picks[prompt.id] = {
+            "admin_id": self.admin_id,
+            "interaction": interaction,
+        }
+
+    @discord.ui.button(label="Post Panel", emoji="✅", style=discord.ButtonStyle.primary)
+    async def post_panel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session = _sessions.get(self.admin_id)
+        if not session:
+            await interaction.response.send_message("⚠️ Session expired, run `/setup apply` again.", ephemeral=True)
+            return
+
+        kind = session["kind"]
+        apply_channel = interaction.guild.get_channel(session["apply_channel_id"])
+        if not apply_channel:
+            await interaction.response.send_message("❌ Apply channel not found.", ephemeral=True)
+            return
+
+        questions   = session.get("questions")   or DEFAULT_QUESTIONS.get(kind, [])
+        conditions  = session.get("conditions")  or DEFAULT_CONDITIONS.get(kind, [])
+        title       = session.get("title")       or f"{config.SERVER_NAME} — {KIND_LABELS.get(kind, kind.title())}"
+
+        cfg = {
+            "apply_channel_id": session["apply_channel_id"],
+            "review_channel_id": session["review_channel_id"],
+            "role_id": session["role_id"],
+            "reviewer_role_id": session.get("reviewer_role_id"),
+            "banner_url": session.get("banner_url", ""),
+            "button_label": session.get("button_label", ""),
+            "button_emoji": session.get("button_emoji", "↗️"),
+            "button_style": session.get("button_style", "grey"),
+            "footer_text": session.get("footer_text", ""),
+            "description": session.get("description", ""),
+            "notice_text": session.get("notice_text", ""),
+            "dm_intro_text": session.get("dm_intro_text", ""),
+            "title": title,
+            "conditions": conditions,
+            "questions": questions,
+        }
+        set_kind_cfg(interaction.guild_id, kind, cfg)
+        _sessions.pop(self.admin_id, None)
+
+        # Components V2 card — one combined message, no embed involved.
+        panel_view = ApplyButtonView(kind, cfg)
+        await apply_channel.send(view=panel_view)
+        # Re-register as persistent so the button keeps working after a bot restart.
+        interaction.client.add_view(panel_view)
+
+        for c in self.children:
+            c.disabled = True
+        confirm = discord.Embed(
+            title="✅ Application Panel Posted!",
+            description=f"Posted in {apply_channel.mention} with {len(questions)} questions and {len(conditions)} conditions.",
+            color=config.SUCCESS_COLOR
+        )
+        await interaction.response.edit_message(embed=confirm, view=self)
+
+
+class QuestionsModal(discord.ui.Modal, title="❓ Set Application Questions"):
+    q1 = discord.ui.TextInput(label="Question 1", max_length=200, required=True)
+    q2 = discord.ui.TextInput(label="Question 2", max_length=200, required=True)
+    q3 = discord.ui.TextInput(label="Question 3", max_length=200, required=True)
+    q4 = discord.ui.TextInput(label="Question 4 (optional)", max_length=200, required=False)
+    q5 = discord.ui.TextInput(label="Question 5 (optional)", max_length=200, required=False)
+
+    def __init__(self, admin_id: int, current: list[str]):
+        super().__init__()
+        self.admin_id = admin_id
+        fields = [self.q1, self.q2, self.q3, self.q4, self.q5]
+        for i, field in enumerate(fields):
+            if i < len(current):
+                field.default = current[i]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        questions = [q.value for q in [self.q1, self.q2, self.q3, self.q4, self.q5] if q.value]
+        session = _sessions.setdefault(self.admin_id, {})
+        session["questions"] = questions
+        embed = discord.Embed(title="✅ Questions Saved", color=config.SUCCESS_COLOR)
+        for i, q in enumerate(questions, 1):
+            embed.add_field(name=f"❓ {i}", value=q, inline=False)
+        embed.set_footer(text="Click Post Panel when you're ready.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class ConditionsModal(discord.ui.Modal, title="📋 Set Conditions"):
+    """One free-form textbox, one condition per line — add or remove as many
+    as you want (Discord modals can't have more than 5 separate fields, so
+    this is the way around that limit)."""
+    conditions_field = discord.ui.TextInput(
+        label="Conditions — one per line",
+        style=discord.TextStyle.paragraph,
+        placeholder="One condition per line, e.g.\nYou must be active in the community.",
+        max_length=4000,
+        required=True,
+    )
+
+    def __init__(self, admin_id: int, current: list[str]):
+        super().__init__()
+        self.admin_id = admin_id
+        self.conditions_field.default = "\n".join(current)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw_lines = self.conditions_field.value.split("\n")
+        conditions = [line.strip() for line in raw_lines if line.strip()][:25]
+        session = _sessions.setdefault(self.admin_id, {})
+        session["conditions"] = conditions
+        embed = discord.Embed(title="✅ Conditions Saved", color=config.SUCCESS_COLOR)
+        embed.description = "\n".join(f"{i}. {c}" for i, c in enumerate(conditions, 1)) or "(none)"
+        embed.set_footer(text="Click Post Panel when you're ready.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class TitleModal(discord.ui.Modal, title="📝 Set Title, Description & Notice"):
+    title_field = discord.ui.TextInput(
+        label="Panel title",
+        placeholder="e.g. FASTLIFE ROLEPLAY — Staff Application",
+        max_length=100,
+        required=False,
+    )
+    description_field = discord.ui.TextInput(
+        label="Description (shown under the title)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Before applying to join our team, make sure you meet the following conditions :",
+        max_length=500,
+        required=False,
+    )
+    notice_field = discord.ui.TextInput(
+        label="Important notice (shown below the conditions)",
+        style=discord.TextStyle.paragraph,
+        placeholder="⚠️ Important Notice: Please fill out the form honestly...",
+        max_length=500,
+        required=False,
+    )
+
+    def __init__(self, admin_id: int, session: dict):
+        super().__init__()
+        self.admin_id = admin_id
+        self.title_field.default = session.get("title", "")
+        self.description_field.default = session.get("description", "")
+        self.notice_field.default = session.get("notice_text", "")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        session = _sessions.setdefault(self.admin_id, {})
+        session["title"] = self.title_field.value.strip()
+        session["description"] = self.description_field.value.strip()
+        session["notice_text"] = self.notice_field.value.strip()
+
+        embed = discord.Embed(title="✅ Title, Description & Notice Saved", color=config.SUCCESS_COLOR)
+        embed.add_field(name="Title", value=session["title"] or "(default)", inline=False)
+        embed.add_field(name="Description", value=session["description"] or "(default)", inline=False)
+        embed.add_field(name="Notice", value=session["notice_text"] or "(default)", inline=False)
+        embed.set_footer(text="Click Post Panel when you're ready.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class DMMessageModal(discord.ui.Modal, title="📨 Set DM Intro Message"):
+    """Used by BOTH Staff and Whitelist now (both use the DM interview flow)
+    — lets each server have its own wording, since the intro message is
+    sent before any question is asked."""
+    message_field = discord.ui.TextInput(
+        label="Message sent in DM before questions",
+        style=discord.TextStyle.paragraph,
+        placeholder="Welcome to {server}! You have {minutes} min per question ({count} total).",
+        max_length=1000,
+        required=False,
+    )
+
+    def __init__(self, admin_id: int, session: dict):
+        super().__init__()
+        self.admin_id = admin_id
+        self.message_field.default = session.get("dm_intro_text", "")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        session = _sessions.setdefault(self.admin_id, {})
+        session["dm_intro_text"] = self.message_field.value.strip()
+
+        embed = discord.Embed(title="✅ DM Message Saved", color=config.SUCCESS_COLOR)
+        embed.description = session["dm_intro_text"] or "(default)"
+        embed.set_footer(text="Placeholders: {server} {count} {minutes} {kind_label}. Used for both Staff and Whitelist (DM flow).")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class ButtonModal(discord.ui.Modal, title="🎛️ Customize Button Text"):
+    label_field = discord.ui.TextInput(
+        label="Button label",
+        placeholder="e.g. Staff Application / Apply for Whitelist",
+        max_length=80,
+        required=False,
+    )
+    style_field = discord.ui.TextInput(
+        label="Button color: grey / blue / green / red",
+        placeholder="grey",
+        max_length=20,
+        required=False,
+    )
+    footer_field = discord.ui.TextInput(
+        label="Message shown next to the button",
+        style=discord.TextStyle.paragraph,
+        placeholder="With love, FASTLIFE ROLEPLAY Team.",
+        max_length=200,
+        required=False,
+    )
+
+    def __init__(self, admin_id: int, session: dict):
+        super().__init__()
+        self.admin_id = admin_id
+        self.label_field.default = session.get("button_label", "")
+        self.style_field.default = session.get("button_style", "grey")
+        self.footer_field.default = session.get("footer_text", "")
+
+    async def on_submit(self, interaction: discord.Interaction):
+        session = _sessions.setdefault(self.admin_id, {})
+        session["button_label"] = self.label_field.value.strip()
+        style = self.style_field.value.strip().lower() or "grey"
+        if style not in BUTTON_STYLES:
+            style = "grey"
+        session["button_style"] = style
+        session["footer_text"] = self.footer_field.value.strip()
+
+        embed = discord.Embed(title="✅ Button Text Saved", color=config.SUCCESS_COLOR)
+        embed.add_field(name="Label", value=session["button_label"] or "(default)", inline=True)
+        embed.add_field(name="Color", value=style, inline=True)
+        embed.add_field(name="Message", value=session["footer_text"] or "(default)", inline=False)
+        embed.set_footer(text="Use Set Emoji for the icon. Click Post Panel when you're ready.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Cog
+# ══════════════════════════════════════════════════════════════════════════
+class ApplySystem(commands.Cog):
+    setup_group = app_commands.Group(
+        name="setup",
+        description="⚙️ Bot setup commands",
+        default_permissions=discord.Permissions(administrator=True),
+    )
+
+    def __init__(self, bot):
+        self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        """Catches the emoji the admin picked via their native emoji picker
+        (see the Set Emoji flow in SetupApplyControlView) and saves it."""
+        pending = _pending_emoji_picks.get(payload.message_id)
+        if not pending or payload.user_id != pending["admin_id"]:
+            return
+
+        _pending_emoji_picks.pop(payload.message_id, None)
+        emoji_str = str(payload.emoji)
+
+        session = _sessions.setdefault(pending["admin_id"], {})
+        session["button_emoji"] = emoji_str
+
+        channel = self.bot.get_channel(payload.channel_id)
+        if channel:
+            try:
+                msg = await channel.fetch_message(payload.message_id)
+                await msg.edit(content=f"✅ Emoji saved: {emoji_str}")
+                await msg.clear_reactions()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+        interaction: discord.Interaction = pending["interaction"]
+        try:
+            embed = discord.Embed(title="✅ Emoji Saved", color=config.SUCCESS_COLOR)
+            embed.add_field(name="Emoji", value=emoji_str, inline=True)
+            embed.set_footer(text="Click Post Panel when you're ready.")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+    @setup_group.command(name="apply", description="📋 Configure the whitelist or staff application system")
+    @app_commands.describe(
+        kind="Which application system to configure",
+        apply_channel="Channel where the Apply button will be posted",
+        review_channel="Channel where staff review applications",
+        role="Role given automatically when an application is accepted",
+        reviewer_role="Role allowed to Accept/Reject/Ask applications (optional, besides admins)",
+        banner_url="Banner image URL for the panel embed (optional)",
+    )
+    @app_commands.choices(kind=[
+        app_commands.Choice(name="📋 Staff Application", value="staff"),
+        app_commands.Choice(name="🎮 Whitelist Application", value="whitelist"),
+    ])
+    async def setup_apply(
+        self,
+        interaction: discord.Interaction,
+        kind: str,
+        apply_channel: discord.TextChannel,
+        review_channel: discord.TextChannel,
+        role: discord.Role,
+        reviewer_role: discord.Role = None,
+        banner_url: str = None,
+    ):
+        existing = get_kind_cfg(interaction.guild_id, kind)
+        _sessions[interaction.user.id] = {
+            "kind": kind,
+            "apply_channel_id": apply_channel.id,
+            "review_channel_id": review_channel.id,
+            "role_id": role.id,
+            "reviewer_role_id": reviewer_role.id if reviewer_role else existing.get("reviewer_role_id"),
+            "banner_url": banner_url or existing.get("banner_url", ""),
+            "title": existing.get("title", ""),
+            "conditions": existing.get("conditions", []),
+            "questions": existing.get("questions", []),
+            "notice_text": existing.get("notice_text", ""),
+            "dm_intro_text": existing.get("dm_intro_text", ""),
+            "description": existing.get("description", ""),
+            "button_label": existing.get("button_label", ""),
+            "button_emoji": existing.get("button_emoji", ""),
+            "button_style": existing.get("button_style", "grey"),
+            "footer_text": existing.get("footer_text", ""),
+        }
+
+        reviewer_line = ""
+        reviewer_id_final = _sessions[interaction.user.id]["reviewer_role_id"]
+        if reviewer_id_final:
+            reviewer_role_obj = interaction.guild.get_role(reviewer_id_final)
+            if reviewer_role_obj:
+                reviewer_line = f"🛂 Reviewer role: {reviewer_role_obj.mention}\n"
+
+        embed = discord.Embed(
+            title=f"⚙️ {KIND_LABELS.get(kind, kind.title())} Setup",
+            description=(
+                f"📢 Apply channel: {apply_channel.mention}\n"
+                f"🔒 Review channel: {review_channel.mention}\n"
+                f"🏅 Role on accept: {role.mention}\n"
+                f"{reviewer_line}\n"
+                "Use the buttons below to set **questions**, **conditions**, "
+                "**title/description/notice**, and **button text**, then click "
+                "**Post Panel** to publish the panel."
+            ),
+            color=config.EMBED_COLOR
+        )
+        embed.set_footer(text=f"{config.SERVER_NAME}")
+        await interaction.response.send_message(embed=embed, view=SetupApplyControlView(interaction.user.id), ephemeral=True)
+
+    @setup_group.command(name="guide", description="📚 Full bot setup guide")
+    async def setup_guide(self, interaction: discord.Interaction):
+        embed = discord.Embed(
+            title=f"⚙️ {config.BOT_NAME} — Setup Guide",
+            description=f"**{config.SERVER_NAME}**",
+            color=config.EMBED_COLOR
+        )
+        embed.add_field(name="👋 Welcome System",  value="`/welcome setup` — Set up the welcome system", inline=False)
+        embed.add_field(name="🎫 Ticket System",   value="`/ticket setup` — Set up the ticket system", inline=False)
+        embed.add_field(name="🌟 Boost System",    value="`/boost setup` — Set up the boost approval system", inline=False)
+        embed.add_field(name="✅ Verify System",   value="`/verify-setup` — Set up member verification", inline=False)
+        embed.add_field(name="📋 Applications",    value="`/setup apply` — Configure staff or whitelist applications", inline=False)
+        embed.add_field(name="🎭 Reaction Roles",  value="`/reactionrole add` — Link emoji+role to any message", inline=False)
+        embed.add_field(name="🔨 Admin Commands",  value="`/ban` `/kick` `/mute` `/warn` `/lock` `/unlock` `/clear` `/slowmode` `/role`", inline=False)
+        embed.set_footer(text=f"{config.SERVER_NAME}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def setup(bot):
+    await bot.add_cog(ApplySystem(bot))
