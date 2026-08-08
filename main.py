@@ -8,10 +8,14 @@ import asyncpg
 from datetime import datetime
 
 from dotenv import load_dotenv
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'))
+
+load_dotenv(
+    dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env')
+)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 db = None
+
 
 async def init_database():
     global db
