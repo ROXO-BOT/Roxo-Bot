@@ -4,13 +4,24 @@ from discord import app_commands
 import config
 import os
 import random
+import asyncpg
 from datetime import datetime
 
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'))
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+db = None
+
+async def init_database():
+    global db
+
+    db = await asyncpg.create_pool(DATABASE_URL)
+
+    print("✅ PostgreSQL database connected!")
+    
 # ═══════════════════════════════════
-# 🚀 FASTLIFE ROLEPLAY BOT
+# 🚀 ROXO ROLEPLAY BOT
 # ═══════════════════════════════════
 
 class FastLifeBot(commands.Bot):
@@ -20,6 +31,7 @@ class FastLifeBot(commands.Bot):
         self._persistent_views_registered = False
 
     async def setup_hook(self):
+        await init_database()
         for file in os.listdir('./cogs'):
             if file.endswith('.py'):
                 try:
