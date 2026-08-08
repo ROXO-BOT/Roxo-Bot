@@ -16,6 +16,12 @@ db = None
 async def init_database():
     global db
 
+    print("🔌 Connecting to PostgreSQL...")
+
+    if not DATABASE_URL:
+        print("❌ DATABASE_URL NOT FOUND!")
+        return
+
     db = await asyncpg.create_pool(DATABASE_URL)
 
     print("✅ PostgreSQL database connected!")
