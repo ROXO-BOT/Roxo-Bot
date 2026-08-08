@@ -48,7 +48,7 @@ class FastLifeBot(commands.Bot):
         self._persistent_views_registered = False
 
     async def setup_hook(self):
-    async def init_database():
+
         for file in os.listdir('./cogs'):
             if file.endswith('.py'):
                 try:
