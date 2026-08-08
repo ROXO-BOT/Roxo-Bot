@@ -37,8 +37,25 @@ class FastLifeBot(commands.Bot):
         self._persistent_views_registered = False
 
     async def setup_hook(self):
-        print("🔥 DATABASE INIT STARTED")
-        await init_database()
+async def init_database():
+    global db
+
+    print("🔌 Connecting to PostgreSQL...")
+
+    if not DATABASE_URL:
+        print("❌ DATABASE_URL NOT FOUND!")
+        return
+
+    db = await asyncpg.create_pool(DATABASE_URL)
+
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            verified BOOLEAN DEFAULT FALSE
+        )
+    """)
+
+    print("✅ PostgreSQL database connected!")
         for file in os.listdir('./cogs'):
             if file.endswith('.py'):
                 try:
